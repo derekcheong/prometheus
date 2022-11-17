@@ -23,10 +23,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2018-10-01/compute"
-	"github.com/Azure/azure-sdk-for-go/services/network/mgmt/2018-10-01/network"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/network/armnetwork"
 	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -174,27 +174,17 @@ func NewDiscovery(cfg *SDConfig, logger log.Logger) *Discovery {
 
 // azureClient represents multiple Azure Resource Manager providers.
 type azureClient struct {
-	nic    network.InterfacesClient
-	vm     compute.VirtualMachinesClient
-	vmss   compute.VirtualMachineScaleSetsClient
-	vmssvm compute.VirtualMachineScaleSetVMsClient
+	nic    armnetwork.InterfacesClient
+	vm     armcompute.VirtualMachinesClient
+	vmss   armcompute.VirtualMachineScaleSetsClient
+	vmssvm armcompute.VirtualMachineScaleSetVMsClient
 }
 
 // createAzureClient is a helper function for creating an Azure compute client to ARM.
 func createAzureClient(cfg SDConfig) (azureClient, error) {
-	env, err := azure.EnvironmentFromName(cfg.Environment)
-	if err != nil {
-		return azureClient{}, err
-	}
-
-	activeDirectoryEndpoint := env.ActiveDirectoryEndpoint
-	resourceManagerEndpoint := env.ResourceManagerEndpoint
-
 	var c azureClient
 
-	var spt *adal.ServicePrincipalToken
-
-	switch cfg.AuthenticationMethod {
+	/*switch cfg.AuthenticationMethod {
 	case authMethodManagedIdentity:
 		spt, err = adal.NewServicePrincipalTokenFromManagedIdentity(resourceManagerEndpoint, &adal.ManagedIdentityOptions{ClientID: cfg.ClientID})
 		if err != nil {
@@ -210,36 +200,36 @@ func createAzureClient(cfg SDConfig) (azureClient, error) {
 		if err != nil {
 			return azureClient{}, err
 		}
-	}
-
-	client, err := config_util.NewClientFromConfig(cfg.HTTPClientConfig, "azure_sd")
+	}*/
+	// TODO: not sure how to handle case authMethodOAuth...
+	credential, err := azidentity.NewManagedIdentityCredential(nil)
 	if err != nil {
 		return azureClient{}, err
 	}
-	sender := autorest.DecorateSender(client)
-	preparer := autorest.WithUserAgent(userAgent)
 
-	bearerAuthorizer := autorest.NewBearerAuthorizer(spt)
+	vm, err := armcompute.NewVirtualMachinesClient(cfg.SubscriptionID, credential, nil)
+	if err != nil {
+		return azureClient{}, err
+	}
+	c.vm = *vm
 
-	c.vm = compute.NewVirtualMachinesClientWithBaseURI(resourceManagerEndpoint, cfg.SubscriptionID)
-	c.vm.Authorizer = bearerAuthorizer
-	c.vm.Sender = sender
-	c.vm.RequestInspector = preparer
+	nic, err := armnetwork.NewInterfacesClient(cfg.SubscriptionID, credential, nil)
+	if err != nil {
+		return azureClient{}, err
+	}
+	c.nic = *nic
 
-	c.nic = network.NewInterfacesClientWithBaseURI(resourceManagerEndpoint, cfg.SubscriptionID)
-	c.nic.Authorizer = bearerAuthorizer
-	c.nic.Sender = sender
-	c.nic.RequestInspector = preparer
+	vmss, err := armcompute.NewVirtualMachineScaleSetsClient(cfg.SubscriptionID, credential, nil)
+	if err != nil {
+		return azureClient{}, err
+	}
+	c.vmss = *vmss
 
-	c.vmss = compute.NewVirtualMachineScaleSetsClientWithBaseURI(resourceManagerEndpoint, cfg.SubscriptionID)
-	c.vmss.Authorizer = bearerAuthorizer
-	c.vmss.Sender = sender
-	c.vmss.RequestInspector = preparer
-
-	c.vmssvm = compute.NewVirtualMachineScaleSetVMsClientWithBaseURI(resourceManagerEndpoint, cfg.SubscriptionID)
-	c.vmssvm.Authorizer = bearerAuthorizer
-	c.vmssvm.Sender = sender
-	c.vmssvm.RequestInspector = preparer
+	vmssvm, err := armcompute.NewVirtualMachineScaleSetVMsClient(cfg.SubscriptionID, credential, nil)
+	if err != nil {
+		return azureClient{}, err
+	}
+	c.vmssvm = *vmssvm
 
 	return c, nil
 }
@@ -307,7 +297,7 @@ func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 	}
 
 	for _, scaleSet := range scaleSets {
-		scaleSetVms, err := client.getScaleSetVMs(ctx, scaleSet)
+		scaleSetVms, err := client.getScaleSetVMs(ctx, d.cfg.ResourceGroup, scaleSet)
 		if err != nil {
 			failuresCount.Inc()
 			return nil, fmt.Errorf("could not get virtual machine scale set vms: %w", err)
@@ -424,93 +414,82 @@ func (d *Discovery) refresh(ctx context.Context) ([]*targetgroup.Group, error) {
 
 func (client *azureClient) getVMs(ctx context.Context, resourceGroup string) ([]virtualMachine, error) {
 	var vms []virtualMachine
-	var result compute.VirtualMachineListResultPage
-	var err error
 	if len(resourceGroup) == 0 {
-		result, err = client.vm.ListAll(ctx)
-	} else {
-		result, err = client.vm.List(ctx, resourceGroup)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("could not list virtual machines: %w", err)
-	}
-	for result.NotDone() {
-		for _, vm := range result.Values() {
-			vms = append(vms, mapFromVM(vm))
+	    pager := client.vm.NewListAllPager(nil)
+		for pager.More() {
+			nextResult, err := pager.NextPage(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("could not list virtual machines: %w", err)
+			}
+			for _, vm := range nextResult.Value {
+				vms = append(vms, mapFromVM(*vm))
+			}
 		}
-		err = result.NextWithContext(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("could not list virtual machines: %w", err)
+	} else {
+		pager := client.vm.NewListPager(resourceGroup, nil)
+		for pager.More() {
+			nextResult, err := pager.NextPage(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("could not list virtual machines: %w", err)
+			}
+			for _, vm := range nextResult.Value {
+				vms = append(vms, mapFromVM(*vm))
+			}
 		}
 	}
 
 	return vms, nil
 }
 
-type VmssListResultPage interface {
-	NextWithContext(ctx context.Context) (err error)
-	NotDone() bool
-	Values() []compute.VirtualMachineScaleSet
-}
-
-func (client *azureClient) getScaleSets(ctx context.Context, resourceGroup string) ([]compute.VirtualMachineScaleSet, error) {
-	var scaleSets []compute.VirtualMachineScaleSet
-	var result VmssListResultPage
-	var err error
+func (client *azureClient) getScaleSets(ctx context.Context, resourceGroup string) ([]armcompute.VirtualMachineScaleSet, error) {
+	var scaleSets []armcompute.VirtualMachineScaleSet
 	if len(resourceGroup) == 0 {
-		var rtn compute.VirtualMachineScaleSetListWithLinkResultPage
-		rtn, err = client.vmss.ListAll(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("could not list virtual machine scale sets: %w", err)
+		pager := client.vmss.NewListAllPager(nil)
+		for pager.More() {
+			nextResult, err := pager.NextPage(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("could not list virtual machine scale sets: %w", err)
+			}
+			for _, scaleset := range nextResult.Value {
+				scaleSets = append(scaleSets, *scaleset)
+			}
 		}
-		result = &rtn
 	} else {
-		var rtn compute.VirtualMachineScaleSetListResultPage
-		rtn, err = client.vmss.List(ctx, resourceGroup)
-		if err != nil {
-			return nil, fmt.Errorf("could not list virtual machine scale sets: %w", err)
-		}
-		result = &rtn
-	}
-
-	for result.NotDone() {
-		scaleSets = append(scaleSets, result.Values()...)
-		err = result.NextWithContext(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("could not list virtual machine scale sets: %w", err)
+		pager := client.vmss.NewListPager(resourceGroup, nil)
+		for pager.More() {
+			nextResult, err := pager.NextPage(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("could not list virtual machine scale sets: %w", err)
+			}
+			for _, scaleset := range nextResult.Value {
+				scaleSets = append(scaleSets, *scaleset)
+			}
 		}
 	}
 
 	return scaleSets, nil
 }
 
-func (client *azureClient) getScaleSetVMs(ctx context.Context, scaleSet compute.VirtualMachineScaleSet) ([]virtualMachine, error) {
+func (client *azureClient) getScaleSetVMs(ctx context.Context, resourceGroup string, scaleSet armcompute.VirtualMachineScaleSet) ([]virtualMachine, error) {
 	var vms []virtualMachine
-	// TODO do we really need to fetch the resourcegroup this way?
-	r, err := newAzureResourceFromID(*scaleSet.ID, nil)
-	if err != nil {
-		return nil, fmt.Errorf("could not parse scale set ID: %w", err)
-	}
 
-	result, err := client.vmssvm.List(ctx, r.ResourceGroup, *(scaleSet.Name), "", "", "")
-	if err != nil {
-		return nil, fmt.Errorf("could not list virtual machine scale set vms: %w", err)
-	}
-	for result.NotDone() {
-		for _, vm := range result.Values() {
-			vms = append(vms, mapFromVMScaleSetVM(vm, *scaleSet.Name))
-		}
-		err = result.NextWithContext(ctx)
+	pager := client.vmssvm.NewListPager(resourceGroup, *(scaleSet.Name), nil)
+
+	for pager.More() {
+		nextResult, err := pager.NextPage(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("could not list virtual machine scale set vms: %w", err)
+		}
+		for _, vm := range nextResult.Value {
+			vms = append(vms, mapFromVMScaleSetVM(*vm, *scaleSet.Name))
 		}
 	}
 
 	return vms, nil
 }
 
-func mapFromVM(vm compute.VirtualMachine) virtualMachine {
-	osType := string(vm.StorageProfile.OsDisk.OsType)
+func mapFromVM(vm armcompute.VirtualMachine) virtualMachine {
+	osType := string(*vm.Properties.StorageProfile.OSDisk.OSType)
 	tags := map[string]*string{}
 	networkInterfaces := []string{}
 	var computerName string
@@ -519,16 +498,16 @@ func mapFromVM(vm compute.VirtualMachine) virtualMachine {
 		tags = vm.Tags
 	}
 
-	if vm.NetworkProfile != nil {
-		for _, vmNIC := range *(vm.NetworkProfile.NetworkInterfaces) {
+	if vm.Properties.NetworkProfile != nil {
+		for _, vmNIC := range vm.Properties.NetworkProfile.NetworkInterfaces {
 			networkInterfaces = append(networkInterfaces, *vmNIC.ID)
 		}
 	}
 
-	if vm.VirtualMachineProperties != nil &&
-		vm.VirtualMachineProperties.OsProfile != nil &&
-		vm.VirtualMachineProperties.OsProfile.ComputerName != nil {
-		computerName = *(vm.VirtualMachineProperties.OsProfile.ComputerName)
+	if vm.Properties != nil &&
+		vm.Properties.OSProfile != nil &&
+		vm.Properties.OSProfile.ComputerName != nil {
+		computerName = *(vm.Properties.OSProfile.ComputerName)
 	}
 
 	return virtualMachine{
@@ -544,8 +523,8 @@ func mapFromVM(vm compute.VirtualMachine) virtualMachine {
 	}
 }
 
-func mapFromVMScaleSetVM(vm compute.VirtualMachineScaleSetVM, scaleSetName string) virtualMachine {
-	osType := string(vm.StorageProfile.OsDisk.OsType)
+func mapFromVMScaleSetVM(vm armcompute.VirtualMachineScaleSetVM, scaleSetName string) virtualMachine {
+	osType := string(*vm.Properties.StorageProfile.OSDisk.OSType)
 	tags := map[string]*string{}
 	networkInterfaces := []string{}
 	var computerName string
@@ -554,14 +533,15 @@ func mapFromVMScaleSetVM(vm compute.VirtualMachineScaleSetVM, scaleSetName strin
 		tags = vm.Tags
 	}
 
-	if vm.NetworkProfile != nil {
-		for _, vmNIC := range *(vm.NetworkProfile.NetworkInterfaces) {
+	if vm.Properties.NetworkProfile != nil {
+		for _, vmNIC := range vm.Properties.NetworkProfile.NetworkInterfaces {
 			networkInterfaces = append(networkInterfaces, *vmNIC.ID)
 		}
 	}
 
-	if vm.VirtualMachineScaleSetVMProperties != nil && vm.VirtualMachineScaleSetVMProperties.OsProfile != nil {
-		computerName = *(vm.VirtualMachineScaleSetVMProperties.OsProfile.ComputerName)
+	if vm.Properties != nil &&
+	    vm.Properties.OSProfile != nil {
+		computerName = *(vm.Properties.OSProfile.ComputerName)
 	}
 
 	return virtualMachine{
